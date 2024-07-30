@@ -25,7 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
-from kernels.ragged_attention import mqa_reference, ragged_mqa, ragged_mqa_2
+from kernels.ragged_attention import ragged_mqa
 import jax.numpy as jnp
 
 import common_types
@@ -130,6 +130,7 @@ class AttentionOp(nn.Module):
   dtype: DType = jnp.float32
   quant: Optional[Quant] = None
   kv_quant: Optional[KVQuant] = None
+  use_ragged_attention: bool = False
 
   def check_attention_inputs(self, query: Array, key: Array| KVTensor, value: Array| KVTensor) -> None:
     """Check attention inputs."""
@@ -211,39 +212,9 @@ class AttentionOp(nn.Module):
     else:
       raise ValueError(f"Unexpected attention kernel {self.attention_kernel=}.")
 
-  def ragged_attention_2(self, query: Array, key: Array, value: Array, lengths: Array) -> tuple[Array, Array, Array]:
-    """Ragged Attention."""
-    # jax.debug.print("lengths: {}", lengths)
-    ragged_qkv = nn.logical_to_mesh_axes(self.cache_logical_axis_names)
-    ragged_lengths = nn.logical_to_mesh_axes(self.ragged_lengths_names)
-    @functools.partial(
-        shard_map,
-        mesh=self.mesh,
-        in_specs=(
-            ragged_qkv,
-            ragged_qkv,
-            ragged_qkv,
-            ragged_lengths,
-        ),
-        out_specs=ragged_qkv,
-        check_rep=False,
-    )
-    def wrap_ragged_attention_2(query, key, value, lengths):
-      # vmap_ragged_mqa = jax.vmap(ragged_mqa, in_axes=[1, 1, 1, None], out_axes=2)
-      o, m, l  = ragged_mqa_2(query, key, value, lengths)
-      m = jnp.expand_dims(m, axis=-1)
-      l = jnp.expand_dims(l, axis=-1)
-      o = o * l 
-      return o, m, l
-
-    # query = jnp.swapaxes(query, 1, 2)
-    # key = jnp.swapaxes(key, 1, 2)
-    # value = jnp.swapaxes(value, 1, 2)
-    return wrap_ragged_attention_2(query, key, value, lengths)
   
   def ragged_attention(self, query: Array, key: Array, value: Array, lengths: Array) -> tuple[Array, Array, Array]:
     """Ragged Attention."""
-    # jax.debug.print("lengths: {}", lengths)
     ragged_qkv = nn.logical_to_mesh_axes(self.ragged_qkv_axis_names)
     ragged_lengths = nn.logical_to_mesh_axes(self.ragged_lengths_names)
     ragged_output = nn.logical_to_mesh_axes(self.cache_logical_axis_names)
@@ -895,8 +866,7 @@ class AttentionOp(nn.Module):
 
   @nn.compact
   def __call__(self, query, key, value, decoder_segment_ids, model_mode):
-    use_ragged = True
-    prefill_kv_cache, ar_kv_cache = self.kv_cache(key, value, decoder_segment_ids, model_mode, use_ragged=use_ragged)
+    prefill_kv_cache, ar_kv_cache = self.kv_cache(key, value, decoder_segment_ids, model_mode, use_ragged=self.use_ragged_attention)
 
     prefill_unnormalized_output, prefill_exponentials_max, prefill_exponentials_sum = self.apply_attention(
         query=query,
@@ -905,7 +875,7 @@ class AttentionOp(nn.Module):
         decoder_segment_ids=prefill_kv_cache[2],
         lengths=None,
         model_mode=model_mode,
-        use_ragged=use_ragged,
+        use_ragged=self.use_ragged_attention,
     )
 
     # Return the "prefill" cache if it actually the combined prefill+ar kv cache
@@ -921,7 +891,7 @@ class AttentionOp(nn.Module):
         decoder_segment_ids=ar_kv_cache[2],
         lengths=ar_kv_cache[3],
         model_mode=model_mode,
-        use_ragged=use_ragged,
+        use_ragged=self.use_ragged_attention,
     )
 
     if ar_unnormalized_output is not None:
@@ -973,6 +943,7 @@ class Attention(nn.Module):
   float32_logits: bool = False  # cast logits in float32 for stability.
   quant: Optional[Quant] = None
   kv_quant: Optional[KVQuant] = None
+  use_ragged_attention: bool = False
 
   # Shard the query activation as the same as the key and value.
   # TODO: Find a better sharding axis name.
@@ -1150,6 +1121,7 @@ class Attention(nn.Module):
         ar_cache_axis_order=self.ar_cache_axis_order,
         compute_axis_order=self.compute_axis_order,
         reshape_q=self.reshape_q,
+        use_ragged_attention=self.use_ragged_attention,
     )
 
     out = attention_op(query, key, value, decoder_segment_ids, model_mode)

@@ -95,6 +95,7 @@ class GemmaDecoderLayer(nn.Module):
         float32_logits=True,
         quant=self.quant,
         kv_quant=quantizations.configure_kv_quant(cfg),
+        use_ragged_attention=cfg.use_ragged_attention,
     )
 
     attention_lnx = attention_layer(

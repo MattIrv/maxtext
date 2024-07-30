@@ -133,18 +133,9 @@ def ragged_mqa(
   def compute_ragged_block_indices(b, i, lengths_ref):
     length = lengths_ref[b]
     not_done = i * bk < length
-
-    # Compare current batch index(?) to see if we are at the last or not
     am_last_batch = b == batch_size - 1
-
-    # Compute the last good block based on the length of the current batch index and the block size
     last_good_block = lax.div(length, bk) - 1
-
-    # Compute next batch index based on 1) if we are at the end of the current batch index's length, 
-    #                               and 2) if we are the last batch index or not 
     b_next = jnp.where(not_done, b, jnp.where(am_last_batch, b, b + 1))
-
-    # Compute next block index based on if we are processing the last block of the current batch index's length or not
     i_next = jnp.where(not_done, i, jnp.where(am_last_batch, last_good_block, 0))
     return b_next, i_next, 0
 
@@ -158,24 +149,24 @@ def ragged_mqa(
           num_scalar_prefetch=1,
           in_specs=[
               pl.BlockSpec(
-                  (None, num_heads, head_dim),  # None gets squeezed
+                  (None, num_heads, head_dim),
                   lambda b, i, _: (b, 0, 0)),
               pl.BlockSpec(
-                  (None, bk, head_dim),         # None gets squeezed
+                  (None, bk, head_dim),       
                   compute_ragged_block_indices),
               pl.BlockSpec(
-                  (None, bk, head_dim),         # None gets squeezed
+                  (None, bk, head_dim),       
                   compute_ragged_block_indices),
           ],
           out_specs=[
               pl.BlockSpec(
-                  (None, num_heads, head_dim), # None gets squeezed
+                  (None, num_heads, head_dim),
                   lambda b, i, _: (b, 0, 0)),
               pl.BlockSpec(
-                  (None, num_heads, head_dim), # None gets squeezed
+                  (None, num_heads, head_dim),
                   lambda b, i, _: (b, 0, 0)),
               pl.BlockSpec(
-                  (None, num_heads, head_dim), # None gets squeezed
+                  (None, num_heads, head_dim),
                   lambda b, i, _: (b, 0, 0)),
           ],
           grid=(batch_size, seq_len // bk),
@@ -187,80 +178,4 @@ def ragged_mqa(
           jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
       ],
   )(lengths, q, k, v)
-  # Creates oml of the same shape: (b, n, d) but then returns only the first two dims of m and l
-  return out, m[..., 0], l[..., 0]
-
-
-@functools.partial(jax.jit, static_argnames=["bk", "mask_value"])
-def ragged_mqa_2(
-    q: jax.Array, # b1nd
-    k: jax.Array, # bsnd
-    v: jax.Array, # bsnd
-    lengths: jax.Array, # b
-    *, 
-    bk: int = 256,
-    mask_value: float = DEFAULT_MASK_VALUE,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-  """Ragged multi query attention."""
-  q_batch_size, q_seq_len, q_num_heads, q_head_dim = q.shape 
-  kv_batch_size, kv_seq_len, kv_num_heads, kv_head_dim = k.shape 
-  assert lengths.dtype == jnp.int32
-
-  def _compute_ragged_block_indices(b, i, lengths_ref):
-    length = lengths_ref[b]
-    not_done = i * bk < length
-    am_last_batch = b == batch_size - 1
-    last_good_block = lax.div(length, bk) - 1
-
-    b_next = jnp.where(not_done, b, jnp.where(am_last_batch, b, b + 1))
-    i_next = jnp.where(
-        not_done, i, jnp.where(am_last_batch, last_good_block, 0)
-    )
-    return b_next, i_next
-
-  def kv_index_map(b, i, n, lengths_ref):
-    b_next, i_next = _compute_ragged_block_indices(b, i, lengths_ref)
-    return b_next, i_next, n, 0
-
-  out, m, l = pl.pallas_call(
-      functools.partial(
-          ragged_flash_attention_kernel,
-          bk=bk,
-          mask_value=mask_value,
-      ),
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=1,
-          in_specs=[
-              pl.BlockSpec(
-                  (None, 1, None, q_head_dim),  
-                  lambda b, i, n, _: (b, 0, n, 0)),
-              pl.BlockSpec(
-                  (None, bk, None, kv_head_dim), 
-                  lambda b, i, n, _: (b, i, n, 0)),
-              pl.BlockSpec(
-                  (None, bk, None, kv_head_dim),
-                  lambda b, i, n, _: (b, i, n, 0)),
-          ],
-          out_specs=[
-              pl.BlockSpec(
-                  (None, 1, None, 128),
-                  lambda b, i, n, _: (b, 0, n, 0)),
-              pl.BlockSpec(
-                  (None, 1, None, 128),
-                  lambda b, i, n, _: (b, 0, n, 0)),
-              pl.BlockSpec(
-                  (None, 1, None, 128),
-                  lambda b, i, n, _: (b, 0, n, 0)),
-          ],
-          grid=(q_batch_size, kv_seq_len // bk, kv_num_heads),
-      ),
-      compiler_params=dict(mosaic=dict(dimension_semantics=["parallel", "arbitrary", "parallel"])),
-      out_shape=[
-        jax.ShapeDtypeStruct(q.shape, jnp.float32),
-        jax.ShapeDtypeStruct(q.shape, jnp.float32),
-        jax.ShapeDtypeStruct(q.shape, jnp.float32),
-      ],
-      interpret=True,
-  )(lengths, q, k, v)
-  # Creates oml of the same shape: (b, n, d) but then returns only the first two dims of m and l
   return out, m[..., 0], l[..., 0]

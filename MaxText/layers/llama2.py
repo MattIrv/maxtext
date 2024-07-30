@@ -110,6 +110,7 @@ class LlamaDecoderLayer(nn.Module):
         ar_cache_axis_order=tuple([int(i) for i in cfg.ar_cache_axis_order.split(",")]),
         compute_axis_order=tuple([int(i) for i in cfg.compute_axis_order.split(",")]),
         reshape_q=cfg.reshape_q,
+        use_ragged_attention=cfg.use_ragged_attention,
     )
 
     attention_lnx = attention_layer(
