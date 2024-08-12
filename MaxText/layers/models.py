@@ -24,6 +24,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import common_types
+import page_managers
 from layers import attentions
 from layers import embeddings
 from layers import linears
@@ -173,6 +174,7 @@ class Decoder(nn.Module):
   shared_embedding: nn.Module
   mesh: Mesh
   quant: Optional[Quant] = None
+  page_manager: Optional[page_managers.PageManager] = None
 
   def get_decoder_layer(self):
     if self.config.decoder_block == "default":
@@ -355,7 +357,7 @@ class Decoder(nn.Module):
         )
       else:
         for lyr in range(cfg.num_decoder_layers):
-          y = RemattedBlockLayer(config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant)(
+          y = RemattedBlockLayer(config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, page_manager=self.page_manager)(
               y,
               decoder_segment_ids,
               decoder_positions,
@@ -402,6 +404,7 @@ class Transformer(nn.Module):
   config: Config
   mesh: Mesh
   quant: Quant
+  page_manager: page_managers.PageManager
 
   def setup(self):
     """Initialize shared_embedding & decoder layers."""
@@ -418,7 +421,13 @@ class Transformer(nn.Module):
         config=cfg,
     )
 
-    self.decoder = Decoder(config=cfg, shared_embedding=self.shared_embedding, mesh=mesh, quant=self.quant)
+    self.decoder = Decoder(
+      config=cfg,
+      shared_embedding=self.shared_embedding,
+      mesh=mesh,
+      quant=self.quant,
+      page_manager=self.page_manager,
+    )
 
   def __call__(
       self,

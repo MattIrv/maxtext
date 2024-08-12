@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 import common_types
+import page_managers
 from jetstream.engine import engine_api
 from jetstream.engine import tokenizer_pb2
 from jetstream.engine import tokenizer_api
@@ -69,7 +70,16 @@ class MaxEngine(engine_api.Engine):
 
     # Model and Optimizer definition
     quant = quantizations.configure_quantization(config)
-    self.model = models.Transformer(config, mesh=self._mesh, quant=quant)
+
+    self.page_manager = page_managers.PageManager(
+      num_pages=self.config.num_pages,
+      page_size=self.config.page_size,
+      slots=self.max_concurrent_decodes,
+      max_target_length=self.config.max_target_length,
+      max_prefill_predict_length=self.config.max_prefill_predict_length,
+    )
+
+    self.model = models.Transformer(config, mesh=self._mesh, quant=quant, page_manager=self.page_manager)
     self.replicated_sharding = jax.sharding.NamedSharding(self._mesh, P(None))
 
     self.abstract_params = None
@@ -90,9 +100,6 @@ class MaxEngine(engine_api.Engine):
     self.abstract_params = jax.tree_util.tree_map(
         lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), state.params
     )
-    self.kv_cache_annotations = max_utils.get_kv_cache_annotations(self.model, self.config, self.rng, self._mesh)
-    self.kv_cache_shardings = jax.tree_util.tree_map(
-      lambda x: jax.sharding.NamedSharding(self._mesh, x), self.kv_cache_annotations)
 
     if self.model.quant and not self.config.checkpoint_is_quantized:
       params = self.quantize_params(state)
@@ -219,6 +226,9 @@ class MaxEngine(engine_api.Engine):
     """Run one generate step"""
     previous_token = decode_state["tokens"]
 
+    if self.config.attention == "paged":
+      self.page_manager.page_state = self.page_manager.reserve_decode_step_pages()
+
     # run one step generation
     with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
       out_logits, new_vars = self.model.apply(
@@ -268,6 +278,23 @@ class MaxEngine(engine_api.Engine):
         "tokens": new_token
     }, result
 
+  def _insert_pages(
+      self,
+      prefix: Prefix,
+      decode_state: DecodeState,
+      slot: int,
+  ) -> None:
+    """Update pages for prefill step."""
+    # seq_num_pages = self.seq_num_pages[slot]
+    # key = jnp.transpose(key, axes=(2, 0, 1, 3))
+    # value = jnp.transpose(value, axes=(2, 0, 1, 3))
+    # for i in range(seq_num_pages):
+    #   assigned_page_idx = self.seq_page_indices[slot][i]
+    #   key_block = jax.lax.dynamic_slice_in_dim(key, (i-1) * self.page_size, self.page_size, axis=2)
+    #   value_block = jax.lax.dynamic_slice_in_dim(value, (i-1) * self.page_size, self.page_size, axis=2)
+    #   key_pages.value = jax.lax.dynamic_update_slice_in_dim(key_pages.value, key_block, assigned_page_idx, axis=1)
+    #   value_pages.value = jax.lax.dynamic_update_slice_in_dim(value_pages.value, value_block, assigned_page_idx, axis=1)
+
   @functools.partial(
       jax.jit,
       static_argnums=(0,),
@@ -284,6 +311,10 @@ class MaxEngine(engine_api.Engine):
   ) -> DecodeState:
     """Insert into KV cache"""
     unboxed_prefix = max_utils.unbox_logicallypartioned(prefix)
+
+    if self.config.attention == "paged":
+      self.page_manager.page_state = self.page_manager.reserve_prefill_slot_pages(slot, length=120)
+      # self._insert_pages(prefix, decode_state, slot)
 
     def copy(path, partial_cache, full_cache, annotations):
       path_key = path[-1].key
@@ -370,7 +401,7 @@ class MaxEngine(engine_api.Engine):
     # pylint: disable=unused-argument
     def init(abstract_params):
       x = jnp.ones(
-          (int(self.config.per_device_batch_size * jax.device_count()), self.config.max_prefill_predict_length),
+          (1, self.config.max_prefill_predict_length),
           dtype=jnp.int32,
       )
       _, cache = self.model.apply(
@@ -411,6 +442,10 @@ class MaxEngine(engine_api.Engine):
       return jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), abstract_outputs)
 
     cache = initialize()["cache"]
+
+    self.kv_cache_annotations = max_utils.get_kv_cache_annotations(self.model, self.config, self.rng, self._mesh)
+    self.kv_cache_shardings = jax.tree_util.tree_map(
+      lambda x: jax.sharding.NamedSharding(self._mesh, x), self.kv_cache_annotations)
 
     def is_lp(k):
       return isinstance(k, flax.linen.spmd.LogicallyPartitioned)

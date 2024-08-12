@@ -30,6 +30,7 @@ from layers import models
 from layers import quantizations
 
 import common_types
+import page_managers
 from typing import Optional
 
 Array = common_types.Array
@@ -64,6 +65,7 @@ class LlamaDecoderLayer(nn.Module):
   config: models.Config
   mesh: Mesh
   quant: Optional[Quant] = None
+  page_manager: Optional[page_managers.PageManager] = None
 
   @nn.compact
   def __call__(
@@ -110,6 +112,7 @@ class LlamaDecoderLayer(nn.Module):
         ar_cache_axis_order=tuple([int(i) for i in cfg.ar_cache_axis_order.split(",")]),
         compute_axis_order=tuple([int(i) for i in cfg.compute_axis_order.split(",")]),
         reshape_q=cfg.reshape_q,
+        page_manager=self.page_manager,
     )
 
     attention_lnx = attention_layer(
