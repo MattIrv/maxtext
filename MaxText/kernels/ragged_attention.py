@@ -58,6 +58,23 @@ def mqa_reference(
   )
   return o, logits_max, denominator
 
+@jax.jit
+def mha_reference(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    lengths: jax.Array,
+    *,
+    mask_value: float = DEFAULT_MASK_VALUE,
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+  q = jnp.swapaxes(q, 1, 2)
+  k = jnp.swapaxes(k, 1, 2)
+  v = jnp.swapaxes(v, 1, 2)
+  return jax.vmap(functools.partial(
+    mqa_reference,
+    mask_value=mask_value),
+    in_axes=(1, 1, 1, None),
+    out_axes=2)(q, k, v, lengths)
 
 def ragged_flash_attention_kernel(
     lengths_ref,
@@ -114,7 +131,6 @@ def ragged_flash_attention_kernel(
     ).astype(o_ref.dtype)
 
 
-@functools.partial(jax.jit, static_argnames=["bk", "mask_value"])
 def ragged_mqa(
     q: jax.Array,
     k: jax.Array,
@@ -123,6 +139,7 @@ def ragged_mqa(
     *, 
     bk: int = 256,
     mask_value: float = DEFAULT_MASK_VALUE,
+    cost_estimate: pltpu.CostEstimate | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Ragged multi query attention."""
   batch_size, num_heads, head_dim = q.shape 
@@ -171,7 +188,12 @@ def ragged_mqa(
           ],
           grid=(batch_size, seq_len // bk),
       ),
-      compiler_params=dict(mosaic=dict(dimension_semantics=["parallel", "arbitrary"])),
+      compiler_params=dict(
+        mosaic=dict(
+          dimension_semantics=("parallel", "arbitrary"),
+          cost_estimate=cost_estimate,
+        )
+      ),
       out_shape=[
           jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
           jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
@@ -179,3 +201,55 @@ def ragged_mqa(
       ],
   )(lengths, q, k, v)
   return out, m[..., 0], l[..., 0]
+
+
+@functools.partial(
+  jax.jit,
+  static_argnames=[
+    "bk",
+    "mask_value",
+  ],
+)
+def mha_ragged(
+  query: jax.Array, 
+  key: jax.Array, 
+  value: jax.Array, 
+  lengths: jax.Array,
+  *,
+  bk: int = 256,
+  mask_value: float = DEFAULT_MASK_VALUE,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  cost_analysis = (
+    mha_reference.lower(
+      query,
+      key,
+      value,
+      lengths,
+      mask_value=mask_value,
+    )
+    .compile()
+    .cost_analysis()[0]
+  )
+  cost_estimate = pltpu.CostEstimate(
+    flops=int(cost_analysis["flops"]),
+    transcendentals=int(cost_analysis["transcendentals"]),
+    bytes_accessed=int(cost_analysis["bytes accessed"]),
+  )
+
+  query = jnp.swapaxes(query, 1, 2)
+  key = jnp.swapaxes(key, 1, 2)
+  value = jnp.swapaxes(value, 1, 2)
+  o, m, l  = jax.vmap(
+    functools.partial(
+      ragged_mqa,
+      bk=bk,
+      mask_value=mask_value,
+      cost_estimate=cost_estimate,
+    ),
+    in_axes=(1, 1, 1, None),
+    out_axes=2,
+  )(query, key, value, lengths)
+  m = jnp.expand_dims(m, axis=-1)
+  l = jnp.expand_dims(l, axis=-1)
+  o = o * l 
+  return o, m, l

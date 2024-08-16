@@ -25,7 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
-from kernels.ragged_attention import ragged_mqa
+from kernels.ragged_attention import mha_ragged
 import jax.numpy as jnp
 
 import common_types
@@ -215,32 +215,24 @@ class AttentionOp(nn.Module):
   
   def ragged_attention(self, query: Array, key: Array, value: Array, lengths: Array) -> tuple[Array, Array, Array]:
     """Ragged Attention."""
-    ragged_qkv = nn.logical_to_mesh_axes(self.ragged_qkv_axis_names)
     ragged_lengths = nn.logical_to_mesh_axes(self.ragged_lengths_names)
-    ragged_output = nn.logical_to_mesh_axes(self.cache_logical_axis_names)
+    bsnd = nn.logical_to_mesh_axes(self.cache_logical_axis_names)
+
     @functools.partial(
         shard_map,
         mesh=self.mesh,
         in_specs=(
-            ragged_qkv,
-            ragged_qkv,
-            ragged_qkv,
+            bsnd,
+            bsnd,
+            bsnd,
             ragged_lengths,
         ),
-        out_specs=ragged_output,
+        out_specs=bsnd,
         check_rep=False,
     )
     def wrap_ragged_attention(query, key, value, lengths):
-      vmap_ragged_mqa = jax.vmap(ragged_mqa, in_axes=[1, 1, 1, None], out_axes=2)
-      o, m, l  = vmap_ragged_mqa(query, key, value, lengths)
-      m = jnp.expand_dims(m, axis=-1)
-      l = jnp.expand_dims(l, axis=-1)
-      o = o * l 
-      return o, m, l
+      return mha_ragged(query, key, value, lengths, bk=256)
 
-    query = jnp.swapaxes(query, 1, 2)
-    key = jnp.swapaxes(key, 1, 2)
-    value = jnp.swapaxes(value, 1, 2)
     return wrap_ragged_attention(query, key, value, lengths)
 
   def tpu_flash_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None) -> Array:
@@ -713,9 +705,14 @@ class AttentionOp(nn.Module):
     ar_cache_update_idx = jnp.squeeze(one_hot_indices)
     ar_cache_update_axis = ar_cache_axis_names.index(CACHE_SEQUENCE)
     if use_ragged:
-      dynamic_update = jax.vmap(jax.lax.dynamic_update_slice, in_axes=(0, 0, (None, 0, None)))
-      cached_key_var.value = dynamic_update(cached_key_var.value, one_token_key_shaped_for_cache, (0, lengths, 0))
-      cached_value_var.value = dynamic_update(cached_value_var.value, one_token_value_shaped_for_cache, (0, lengths, 0))
+      def key_body(i, val):
+        return val.at[i, :, lengths[i], :].set(one_token_key_shaped_for_cache[i, :, 0, :])
+
+      def value_body(i, val):
+        return val.at[i, :, lengths[i], :].set(one_token_value_shaped_for_cache[i, :, 0, :])
+
+      cached_key_var.value = jax.lax.fori_loop(0, one_token_key_shaped_for_cache.shape[0], key_body, cached_key_var.value, unroll=8)
+      cached_value_var.value = jax.lax.fori_loop(0, one_token_value_shaped_for_cache.shape[0], value_body, cached_value_var.value, unroll=8)
 
     else: 
       one_hot_indices = one_hot_indices.astype(int)
