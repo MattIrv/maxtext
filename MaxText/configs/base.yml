@@ -537,3 +537,7 @@ sa_use_fused_bwd_kernel: False
 sa_q_layout: "HEAD_DIM_MINOR"
 sa_k_layout: "HEAD_DIM_MINOR"
 sa_v_layout: "HEAD_DIM_MINOR"
+
+# Attributes needed for the MaxText checkpointing loop using standalone_checkpointer.
+gcs_metrics_bucket: distributed-checkpointing-metrics
+per_step_interval: 0.0
