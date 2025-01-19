@@ -124,7 +124,7 @@ def checkpoint_loop(config, state=None):
               step,
               args=orbax.checkpoint.args.Composite(items=orbax.checkpoint.args.PyTreeRestore(item=unboxed_abstract_state)),
             )
-        if state:
+        if state and not isinstance(checkpoint_manager, emergency_checkpoint_manager.CheckpointManager):
           state = state["items"]
       except FileNotFoundError:
         # No checkpoint was found for the step, presumably because one was not produced for the step. Continue on.
