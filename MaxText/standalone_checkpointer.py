@@ -126,8 +126,9 @@ def checkpoint_loop(config, state=None):
             )
         if state and not isinstance(checkpoint_manager, emergency_checkpoint_manager.CheckpointManager):
           state = state["items"]
-      except FileNotFoundError:
+      except (FileNotFoundError, ValueError):
         # No checkpoint was found for the step, presumably because one was not produced for the step. Continue on.
+        # The default checkpointer raises FileNotFoundError and the emergency checkpointer raises ValueError.
         continue
       jax.block_until_ready(state)
       end_time = datetime.datetime.now()
